@@ -1,0 +1,74 @@
+name: Build MapSpooner
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 15
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+
+      - name: Prepare ScriptHookV SDK
+        run: |
+          $sdk = Join-Path $env:GITHUB_WORKSPACE 'sdk/ScriptHookV'
+          function Test-Sdk([string] $root) {
+            (Test-Path (Join-Path $root 'inc/main.h') -PathType Leaf) -and
+            (Test-Path (Join-Path $root 'lib/ScriptHookV.lib') -PathType Leaf)
+          }
+
+          if (-not (Test-Sdk $sdk)) {
+            $sources = @(
+              'https://www.dev-c.com/files/ScriptHookV_SDK_1.0.617.1a.zip',
+              'https://ntscorp.ru/dev-c/ScriptHookV_SDK_1.0.617.1a.zip'
+            )
+            $referer = 'https://www.dev-c.com/gtav/scripthookv/'
+            for ($i = 0; $i -lt $sources.Count; $i++) {
+              $attempt = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP "shv-sdk-$i")
+              $archive = Join-Path $attempt.FullName 'sdk.zip'
+              $unpacked = Join-Path $attempt.FullName 'unpacked'
+              try {
+                Invoke-WebRequest -Uri $sources[$i] -Headers @{ Referer = $referer } -TimeoutSec 45 -OutFile $archive
+                Expand-Archive -LiteralPath $archive -DestinationPath $unpacked
+                $header = Get-ChildItem -LiteralPath $unpacked -Recurse -Filter main.h -File |
+                  Where-Object { $_.Directory.Name -eq 'inc' -and (Test-Sdk $_.Directory.Parent.FullName) } |
+                  Select-Object -First 1
+                if (-not $header) { throw 'inc/main.h and lib/ScriptHookV.lib were not found together.' }
+                $sdk = $header.Directory.Parent.FullName
+                break
+              } catch {
+                Write-Warning "SDK download attempt $($i + 1) failed. $($_.Exception.Message)"
+              }
+            }
+          }
+
+          if (-not (Test-Sdk $sdk)) {
+            throw 'ScriptHookV SDK unavailable. Place an extracted official SDK in sdk/ScriptHookV and rerun.'
+          }
+          "SCRIPTHOOKV_SDK=$sdk" >> $env:GITHUB_ENV
+
+      - name: Configure project
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 "-DSCRIPTHOOKV_SDK=$env:SCRIPTHOOKV_SDK" -DBUILD_TESTING=ON
+
+      - name: Build Release
+        run: cmake --build build --config Release --parallel
+
+      - name: Run core tests
+        run: ctest --test-dir build -C Release --output-on-failure --no-tests=error
+
+      - name: Upload MapSpooner.asi
+        uses: actions/upload-artifact@v7
+        with:
+          name: MapSpooner-Legacy-x64
+          path: build/Release/MapSpooner.asi
+          if-no-files-found: error
