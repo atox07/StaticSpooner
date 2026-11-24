@@ -64,7 +64,7 @@ bool FitsFirstFace(const Ray& ray, const Hit& hit, const Snapshot& entity,
     const Vec3 heading = ray.end - ray.start;
     const float length = std::sqrt(Dot(heading, heading));
     if (!(length > 0.01f)) return false;
-    float near = 0.f, far = length;
+    float entryDistance = 0.f, exitDistance = length;
     const Vec3 direction = heading * (1.f / length);
     for (int i = 0; i < 3; ++i) {
         const auto& row = entity.matrix.row[i];
@@ -80,12 +80,12 @@ bool FitsFirstFace(const Ray& ray, const Hit& hit, const Snapshot& entity,
             continue;
         }
         const float a = (lower - localStart) / localStep, b = (upper - localStart) / localStep;
-        near = std::max(near, std::min(a, b));
-        far = std::min(far, std::max(a, b));
-        if (near > far) return false;
+        entryDistance = std::max(entryDistance, std::min(a, b));
+        exitDistance = std::min(exitDistance, std::max(a, b));
+        if (entryDistance > exitDistance) return false;
     }
     const float actual = Dot(hit.point - ray.start, direction);
-    return near > 0.f && std::abs(near - actual) <= 0.18f;
+    return entryDistance > 0.f && std::abs(entryDistance - actual) <= 0.18f;
 }
 
 bool ReadPool(Pool& pool) {
