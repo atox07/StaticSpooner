@@ -1,6 +1,6 @@
-# Map Spooner 0.1.2 · GTA V Legacy
+# Map Spooner 0.1.4 · GTA V Legacy
 
-Prototipo C++20 per ScriptHookV in modalità Storia. Il progetto predefinito apre la freecam, esegue il raycast, mostra il punto colpito con il gizmo e riporta l'eventuale handle del bersaglio. Per la selezione di una `CBuilding` senza handle e lo spostamento della mappa occorre un adattatore RAGE verificato sulla propria build. Quell'adattatore non è incluso. Il punto di collegamento è `ResolveLegacy`.
+Prototipo C++20 per ScriptHookV in modalità Storia. I prop di script si possono spostare temporaneamente con il gizmo. Sulla build Legacy 1.0.3889.0 è disponibile una prova separata di traslazione di 5 metri per un edificio isolato, attivabile con **T** quando il pannello mostra un candidato.
 
 ## Comandi
 
@@ -10,21 +10,25 @@ Prototipo C++20 per ScriptHookV in modalità Storia. Il progetto predefinito apr
 | Mouse / WASD | Orienta o sposta la freecam |
 | Spazio / Ctrl / Shift | Sali, scendi o accelera |
 | E | Seleziona il primo collider rilevato lungo il raggio. Ripristina prima l'edit precedente |
-| Frecce | Trasla lungo gli assi globali X e Y, con profilo RAGE attivo |
-| PagSu / PagGiù | Trasla lungo Z, con profilo RAGE attivo |
-| Mouse sinistro sull'asse evidenziato | Trascina l'asse sotto il mirino, con profilo RAGE attivo |
+| Frecce | Trasla la selezione spostabile lungo gli assi globali X e Y |
+| PagSu / PagGiù | Trasla la selezione spostabile lungo Z |
+| Mouse sinistro sull'asse giallo | Trascina la selezione spostabile lungo l'asse evidenziato sotto il mirino |
 | R | Ripristina la selezione e l'eventuale edit |
+| T | Prova a traslare di 5 metri il candidato statico lungo la normale della superficie |
 
+Il prototipo tiene un edit temporaneo alla volta. Chiudi lo Spooner con F12 prima di scaricare a caldo l'ASI, così il ripristino gira sulla fibra ScriptHookV. Il raycast lavora sulle collisioni, quindi una mesh priva di collider non è selezionabile mediante questa modalità. In ispezione pura, un hit mondo mostra il punto del collider e un prop con handle mostra l'handle restituito dal raycast.
 
 ## Diagnostica di avvio e build 3889
 
 La versione 0.1.1 registra F12 tramite il callback tastiera di ScriptHookV e usa il vero native `IS_PAUSE_MENU_ACTIVE` (`0xB0034A223497FFCB`). La versione precedente usava per errore l'hash di `NETWORK_IS_PLAYER_ACTIVE` senza passarle un giocatore.
 
-Una build da questo sorgente scrive `MapSpooner.log` accanto all'ASI, con le tappe `ScriptMain started`, `F12 received`, creazione e rendering della camera, risultati del raycast e riscontro delle firme RAGE in memoria. Il pacchetto binario separato **F12 Hotfix** corregge solo l'hash nell'ASI originale e serve per provare subito F12.
+La build scrive `MapSpooner.log` accanto a `GTA5.exe`, con le tappe `ScriptMain started`, `F12 received`, creazione e rendering della camera, risultati del raycast e riscontro delle firme RAGE in memoria. Se la cartella del gioco non è scrivibile, prova `%TEMP%\MapSpooner.log`. L'HUD indica la destinazione effettiva.
 
 La versione 0.1.2 cambia il percorso di **E** dopo la segnalazione di eccezione in `GTA5.exe+0x016CD1A3`. Avvia un raycast asincrono, legge il risultato nei frame successivi solo finché il test è in corso e usa il layout `Vector3` dell'SDK. Il percorso generico mostra il punto e l'eventuale handle. Nel log compaiono `E received`, l'avvio del probe, il suo handle e la prima lettura del risultato. Questo distingue un problema all'avvio del probe da uno durante la lettura.
 
-La copia su disco di `GTA5.exe` 1.0.3889.0 non corrisponde alle firme pubbliche provate per costruzione, caricamento/scaricamento e conversione GUID delle entità mappa. Il resolver ripete la ricerca nelle pagine leggibili del gioco caricato. Anche se trova una firma univoca, per attivare le scritture servono ancora la verifica del passaggio da hit fisico a proprietario, il link LOD e il ciclo di vita della collisione statica. Il resolver predefinito registra i risultati e lascia disponibile l'ispezione.
+Sulla build 1.0.3889.0 ho verificato in memoria le firme del registro streaming e di `UpdateTransform`, il pool delle YMAP e la voce della vtable usata dagli edifici. Il selettore sperimentale confronta il punto colpito con la faccia di ingresso del bounding box orientato e rifiuta corrispondenze ambigue e istanze con collegamenti LOD rilevati.
+
+La prova su **T** controlla la superficie di origine e che il campione di destinazione sia libero. Invoca poi `UpdateTransform` sull'istanza originale e verifica che la collisione scompaia nel punto di partenza e ricompaia nel punto di arrivo. Se un controllo fallisce, tenta immediatamente di ripristinare la matrice originale. **R** ripristina un risultato riuscito. Restano escluse le catene LOD e le collisioni incorporate che il motore lascia nella YBN originale. I raycast controllano due punti campionati, non l'intera geometria. Compilazione e prova in gioco della 0.1.4 da eseguire.
 
 ## Compilazione
 

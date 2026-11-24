@@ -95,6 +95,13 @@ struct Chain {
     bool editable{};
 };
 
+struct BuildingTrial {
+    std::uintptr_t entity{}, contents{}, archetype{};
+    std::uint32_t slot{}, index{}, mapHash{}, model{};
+    std::uint8_t generation{};
+    Matrix34 original;
+};
+
 class Image;
 void LogDiagnostic(const char* format, ...);
 struct RageApi {
@@ -109,6 +116,8 @@ struct RageApi {
     // be synchronous and guaranteed after a successful acquire.
     bool (*apply)(std::uint64_t lease, const Chain& target){};
     void (*restoreAndRelease)(std::uint64_t lease){};
+    bool (*findTrial)(const Ray&, const Hit&, BuildingTrial&){};
+    bool (*setTrialPosition)(const BuildingTrial&, Vec3){};
 };
 
 RageApi ResolveLegacy(const Image& image);

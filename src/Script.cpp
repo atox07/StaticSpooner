@@ -11,12 +11,28 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <iterator>
 #include <type_traits>
 
 namespace spooner {
 namespace {
-HMODULE moduleHandle{};
 std::atomic_bool toggleRequested{};
+enum class LogLocation { Unavailable, Game, Temp };
+LogLocation logLocation{};
+
+bool AppendLog(wchar_t (&path)[MAX_PATH], std::size_t directoryLength, const char* line, DWORD size) {
+    constexpr wchar_t name[] = L"MapSpooner.log";
+    if (!directoryLength || directoryLength + std::size(name) > MAX_PATH) return false;
+    std::memcpy(path + directoryLength, name, sizeof(name));
+    const HANDLE file = CreateFileW(path, FILE_APPEND_DATA,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                    nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    DWORD written{};
+    const bool ok = WriteFile(file, line, size, &written, nullptr) && written == size;
+    CloseHandle(file);
+    return ok;
+}
 
 void OnKeyboard(DWORD key, WORD, BYTE, BOOL, BOOL, BOOL wasDown, BOOL isUp) {
     if (key == VK_F12 && !wasDown && !isUp) {
@@ -26,21 +42,29 @@ void OnKeyboard(DWORD key, WORD, BYTE, BOOL, BOOL, BOOL wasDown, BOOL isUp) {
 }
 
 void LogDiagnostic(const char* format, ...) {
-    wchar_t path[MAX_PATH]{};
-    const auto length = GetModuleFileNameW(moduleHandle, path, MAX_PATH);
-    if (!length || length >= MAX_PATH) return;
-    auto* fileName = std::wcsrchr(path, L'\\');
-    if (!fileName) return;
-    ++fileName;
-    if (wcscpy_s(fileName, MAX_PATH - (fileName - path), L"MapSpooner.log") != 0) return;
-    FILE* file{};
-    if (_wfopen_s(&file, path, L"a") != 0 || !file) return;
+    char line[512]{};
     va_list args;
     va_start(args, format);
-    std::vfprintf(file, format, args);
+    _vsnprintf_s(line, sizeof(line) - 2, _TRUNCATE, format, args);
     va_end(args);
-    std::fputc('\n', file);
-    std::fclose(file);
+    const auto end = std::strlen(line);
+    line[end] = '\r';
+    line[end + 1] = '\n';
+    const DWORD size = static_cast<DWORD>(end + 2);
+    wchar_t path[MAX_PATH]{};
+    const auto length = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    const auto* separator = length && length < MAX_PATH ? std::wcsrchr(path, L'\\') : nullptr;
+    if (separator && AppendLog(path, static_cast<std::size_t>(separator - path + 1), line, size)) {
+        logLocation = LogLocation::Game;
+        return;
+    }
+    const auto tempLength = GetTempPathW(MAX_PATH, path);
+    if (tempLength && tempLength < MAX_PATH && AppendLog(path, tempLength, line, size)) {
+        logLocation = LogLocation::Temp;
+        return;
+    }
+    logLocation = LogLocation::Unavailable;
+    OutputDebugStringA(line);
 }
 
 namespace {
@@ -74,6 +98,10 @@ template<class R = void, class... A> R Call(std::uint64_t hash, A... args) {
 }
 
 constexpr auto DoesEntityExist = 0x7239B21A38F536BAull;
+constexpr auto GetEntityType = 0x8ACD366038D14505ull;
+constexpr auto GetEntityModel = 0x9F47B058362C84B5ull;
+constexpr auto GetEntityCoords = 0x3FEF770D40960D5Aull;
+constexpr auto IsEntityAMissionEntity = 0x0A7B270912999B3Cull;
 constexpr auto SetEntityCollision = 0x1A9205C1B9EE827Full;
 constexpr auto SetEntityCoordsNoOffset = 0x239A3351AC1DA385ull;
 constexpr auto RemoveModel = 0xE532F5D78798DAABull;
@@ -105,14 +133,16 @@ int ReadRaycast(int probe, Hit& result) {
     return status;
 }
 
-void Text(float y, const char* message) {
-    Call(0x07C837F9A01C34C9ull, 0.f, 0.30f);             // SET_TEXT_SCALE
+void TextAt(float x, float y, const char* message, float size = 0.30f) {
+    Call(0x07C837F9A01C34C9ull, 0.f, size);              // SET_TEXT_SCALE
     Call(0xBE6B23FFA53FB442ull, 255, 255, 255, 255);       // SET_TEXT_COLOUR
     Call(0x2513DFB0FB8400FEull);                          // SET_TEXT_OUTLINE
     Call(0x25FBB336DF1804CBull, "STRING");                // BEGIN_TEXT_COMMAND_DISPLAY_TEXT
     Call(0x6C188BE134E074AAull, message);                 // ADD_TEXT_COMPONENT_SUBSTRING_PLAYER_NAME
-    Call(0xCD015E5BB0D96A57ull, 0.022f, y, 0);           // END_TEXT_COMMAND_DISPLAY_TEXT
+    Call(0xCD015E5BB0D96A57ull, x, y, 0);                // END_TEXT_COMMAND_DISPLAY_TEXT
 }
+
+void Text(float y, const char* message) { TextAt(0.022f, y, message); }
 
 constexpr std::array<Vec3, 3> Axes{{{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}};
 constexpr int Colors[3][3]{{255, 70, 70}, {70, 255, 100}, {70, 145, 255}};
@@ -122,29 +152,62 @@ bool Project(Vec3 p, float& x, float& y) {
 
 struct Gizmo {
     int hovered{-1};
-    float screenX{}, screenY{}, length{};
+    float screenX{}, screenY{}, length{}, aspect{1.f};
 };
 
+float Magnitude(Vec3 v) {
+    return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+}
+
+Vec3 Cross(Vec3 a, Vec3 b) {
+    return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+}
+
+void Triangle(Vec3 a, Vec3 b, Vec3 c, const int (&color)[3]) {
+    constexpr auto DrawPoly = 0xAC26716048436851ull;
+    Call(DrawPoly, a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z, color[0], color[1], color[2], 255);
+    Call(DrawPoly, c.x, c.y, c.z, b.x, b.y, b.z, a.x, a.y, a.z, color[0], color[1], color[2], 255);
+}
+
+void DrawArrow(Vec3 pivot, Vec3 towardCamera, Vec3 axis, float length, const int (&color)[3]) {
+    const auto transverse = Cross(axis, towardCamera);
+    const float width = Magnitude(transverse);
+    if (width < 0.0001f) return;
+    const auto sideways = transverse * (length / width);
+    const auto shaft = sideways * 0.026f;
+    const auto head = sideways * 0.075f;
+    const auto shoulder = pivot + axis * (length * 0.73f);
+    Triangle(pivot + shaft, pivot - shaft, shoulder + shaft, color);
+    Triangle(pivot - shaft, shoulder - shaft, shoulder + shaft, color);
+    Triangle(shoulder + head, shoulder - head, pivot + axis * length, color);
+}
+
 Gizmo DrawGizmo(Vec3 pivot, Vec3 camera, int activeAxis) {
-    const auto difference = pivot - camera;
-    const float distance = std::sqrt(difference.x * difference.x +
-                                     difference.y * difference.y +
-                                     difference.z * difference.z);
+    const auto towardCamera = camera - pivot;
+    const float distance = Magnitude(towardCamera);
     Gizmo result;
-    result.length = std::clamp(distance * 0.10f, 0.7f, 18.f);
+    if (distance < 0.01f || !std::isfinite(distance)) return result;
+    pivot = pivot + towardCamera * (std::clamp(distance * 0.008f, 0.025f, 0.4f) / distance);
+    result.length = std::clamp(distance * 0.15f, 0.8f, 25.f);
+    result.aspect = std::clamp(Call<float>(0xF1307EF624A80D87ull, false), 1.f, 4.f);
     float x{}, y{};
     const bool projected = Project(pivot, x, y);
-    float nearest = 0.012f * 0.012f;
+    float nearest = 0.022f * 0.022f;
+    float screenEnd[3][2]{};
+    bool endVisible[3]{};
     for (int i = 0; i < 3; ++i) {
         const auto end = pivot + Axes[i] * result.length;
         float ex{}, ey{};
         if (projected && Project(end, ex, ey)) {
-            const float dx = ex - x, dy = ey - y;
+            screenEnd[i][0] = ex;
+            screenEnd[i][1] = ey;
+            endVisible[i] = true;
+            const float dx = (ex - x) * result.aspect, dy = ey - y;
             const float lengthSquared = dx * dx + dy * dy;
-            if (lengthSquared > 0.000025f) {
-                const float t = std::clamp(((0.5f - x) * dx + (0.5f - y) * dy) /
-                                          lengthSquared, 0.25f, 1.f);
-                const float fromX = x + dx * t - 0.5f, fromY = y + dy * t - 0.5f;
+            if (lengthSquared > 0.0001f) {
+                const float aimX = (0.5f - x) * result.aspect, aimY = 0.5f - y;
+                const float t = std::clamp((aimX * dx + aimY * dy) / lengthSquared, 0.20f, 1.f);
+                const float fromX = dx * t - aimX, fromY = dy * t - aimY;
                 const float d2 = fromX * fromX + fromY * fromY;
                 if (d2 < nearest) {
                     nearest = d2;
@@ -157,12 +220,13 @@ Gizmo DrawGizmo(Vec3 pivot, Vec3 camera, int activeAxis) {
         }
     }
 
+    constexpr int highlighted[3]{255, 226, 90};
+    constexpr const char* names[3]{"X", "Y", "Z"};
+    const int highlightedAxis = activeAxis >= 0 ? activeAxis : result.hovered;
     for (int i = 0; i < 3; ++i) {
-        const auto end = pivot + Axes[i] * result.length;
-        const bool highlight = i == activeAxis || (activeAxis < 0 && i == result.hovered);
-        const auto& rgb = Colors[i];
-        Call(0x6B7256074AE34680ull, pivot.x, pivot.y, pivot.z, end.x, end.y, end.z,
-             highlight ? 255 : rgb[0], highlight ? 255 : rgb[1], highlight ? 255 : rgb[2], 255);
+        DrawArrow(pivot, towardCamera, Axes[i], result.length,
+                  i == highlightedAxis ? highlighted : Colors[i]);
+        if (endVisible[i]) TextAt(screenEnd[i][0] + 0.004f, screenEnd[i][1] - 0.01f, names[i], 0.25f);
     }
     return result;
 }
@@ -230,14 +294,101 @@ public:
         pivot_ = hit.point;
         selected_ = true;
         if (!hit.handle) {
-            std::snprintf(label_, sizeof(label_), "Hit mondo | CBuilding non risolta (handle 0)");
+            if (api_.findTrial && api_.setTrialPosition && api_.findTrial(ray, hit, trial_)) {
+                trialHit_ = hit;
+                std::snprintf(label_, sizeof(label_), "Edificio %08X | T prova spostamento di 5 m",
+                              trial_.model);
+                return;
+            }
+            std::snprintf(label_, sizeof(label_), "Superficie mappa | sola ispezione");
             return;
         }
-        std::snprintf(label_, sizeof(label_), "Entita' colpita | handle %d", hit.handle);
+
+        // GTA's mission/script objects have a real script handle. Static map
+        // drawables and ambient objects with temporary handles stay read-only.
+        if (Call<BOOL>(DoesEntityExist, hit.handle) && Call<int>(GetEntityType, hit.handle) == 3 &&
+            Call<BOOL>(IsEntityAMissionEntity, hit.handle)) {
+            const auto origin = Unpack(Call<Vector3>(GetEntityCoords, hit.handle, false));
+            const auto model = Call<std::uint32_t>(GetEntityModel, hit.handle);
+            if (Finite(origin) && model) {
+                prop_ = hit.handle;
+                propModel_ = model;
+                propOrigin_ = origin;
+                std::snprintf(label_, sizeof(label_), "Prop %08X | spostabile", model);
+                LogDiagnostic("Editable script prop handle=%d model=%08X", prop_, propModel_);
+                return;
+            }
+        }
+        std::snprintf(label_, sizeof(label_), "Entita' %d | sola ispezione", hit.handle);
+    }
+
+    void StartTrial() {
+        if (!trial_.entity || trialPhase_ != TrialPhase::Idle || trialMoved_) return;
+        const float normalLength = Magnitude(trialHit_.normal);
+        if (!(normalLength > 0.9f && normalLength < 1.1f)) return;
+        trialNormal_ = trialHit_.normal * (1.f / normalLength);
+        trialOffset_ = trialNormal_ * 5.f;
+        StartTrialProbe(TrialPhase::OriginBefore, trialHit_.point);
+    }
+
+    void PollTrial() {
+        if (trialPhase_ == TrialPhase::Idle) return;
+        Hit hit{};
+        const int result = ReadRaycast(trialProbe_, hit);
+        if (result == 1 && GetTickCount64() - trialStarted_ < 2500) return;
+        if (result != 2) {
+            FinishTrial("Prova annullata: raycast di verifica fallito");
+            return;
+        }
+        const auto phase = trialPhase_;
+        if (phase == TrialPhase::OriginBefore && hit.hit && !hit.handle &&
+            Magnitude(hit.point - trialHit_.point) < 0.18f) {
+            StartTrialProbe(TrialPhase::DestinationBefore, trialHit_.point + trialOffset_);
+        } else if (phase == TrialPhase::DestinationBefore && !hit.hit) {
+            // After the engine call, a failed readback can still mean the
+            // matrix changed. Keep rollback armed before making the call.
+            trialMoved_ = true;
+            if (!api_.setTrialPosition(trial_, trialOffset_)) {
+                FinishTrial("Prova annullata: aggiornamento edificio fallito");
+                return;
+            }
+            offset_ = trialOffset_;
+            StartTrialProbe(TrialPhase::OriginAfter, trialHit_.point);
+        } else if (phase == TrialPhase::OriginAfter && !hit.hit) {
+            StartTrialProbe(TrialPhase::DestinationAfter, trialHit_.point + trialOffset_);
+        } else if (phase == TrialPhase::DestinationAfter && hit.hit && !hit.handle &&
+                   Magnitude(hit.point - trialHit_.point - trialOffset_) < 0.25f) {
+            trialPhase_ = TrialPhase::Idle;
+            status_ = "Prova riuscita sulle due superfici campionate | R Ripristina";
+            LogDiagnostic("Static trial passed both collision samples");
+        } else {
+            const char* reason = "Prova annullata: collisione non segue l'edificio";
+            if (phase == TrialPhase::OriginBefore) reason = "Prova annullata: origine non confermata";
+            if (phase == TrialPhase::DestinationBefore) reason = "Prova annullata: destinazione occupata";
+            FinishTrial(reason);
+        }
+    }
+
+    bool SameProp() const {
+        return prop_ && Call<BOOL>(DoesEntityExist, prop_) && Call<int>(GetEntityType, prop_) == 3 &&
+               Call<std::uint32_t>(GetEntityModel, prop_) == propModel_;
+    }
+
+    void MoveProp() {
+        if (!SameProp()) {
+            ResetSelection();
+            status_ = "Prop non piu' disponibile";
+            return;
+        }
+        const auto p = propOrigin_ + requestedOffset_;
+        Call(SetEntityCoordsNoOffset, prop_, p.x, p.y, p.z, true, true, true);
+        offset_ = requestedOffset_;
+        propMoved_ = true;
+        pending_ = false;
     }
 
     bool CanEdit() const {
-        return chain_.editable && api_.acquire && api_.apply && api_.restoreAndRelease;
+        return prop_ || (chain_.editable && api_.acquire && api_.apply && api_.restoreAndRelease);
     }
     bool Selected() const { return selected_; }
     Vec3 Pivot() const { return pivot_ + offset_; }
@@ -245,7 +396,11 @@ public:
     const char* Status() const { return status_; }
 
     void Move(Vec3 delta) {
-        if (!CanEdit()) return;
+        if (!CanEdit()) {
+            if (selected_) status_ = "Selezione in sola ispezione";
+            return;
+        }
+        if (delta.x == 0.f && delta.y == 0.f && delta.z == 0.f) return;
         const auto proposed = (pending_ ? requestedOffset_ : offset_) + delta;
         if (!std::isfinite(proposed.x) || !std::isfinite(proposed.y) || !std::isfinite(proposed.z)) return;
         requestedOffset_ = proposed;
@@ -259,6 +414,10 @@ public:
             return;
         }
         if (!pending_) return;
+        if (prop_) {
+            MoveProp();
+            return;
+        }
         const auto& root = chain_.entry[0];
         if (!proxy_) {
             if (!loading_) {
@@ -323,7 +482,40 @@ public:
     }
 
 private:
+    enum class TrialPhase { Idle, OriginBefore, DestinationBefore, OriginAfter, DestinationAfter };
+
+    void StartTrialProbe(TrialPhase next, Vec3 center) {
+        const auto half = trialNormal_ * 0.55f;
+        trialProbe_ = StartRaycast({center + half, center - half, ray_.ignore});
+        if (!trialProbe_) {
+            FinishTrial("Prova annullata: raycast di verifica rifiutato");
+            return;
+        }
+        trialPhase_ = next;
+        trialStarted_ = GetTickCount64();
+        LogDiagnostic("Static trial phase=%d", int(next));
+        status_ = "Verifica collisione in corso...";
+    }
+
+    void FinishTrial(const char* message) {
+        const bool restored = !trialMoved_ || api_.setTrialPosition(trial_, {});
+        LogDiagnostic("Static trial finish: %s (rollback=%d)", message, int(restored));
+        trialMoved_ = !restored;
+        trialPhase_ = TrialPhase::Idle;
+        if (restored) offset_ = {};
+        status_ = restored ? message : "Ripristino rifiutato: istanza non piu' valida";
+    }
+
     void ResetSelection() {
+        if (trialMoved_ || trialPhase_ != TrialPhase::Idle) FinishTrial("Static trial reset");
+        trial_ = {};
+        trialMoved_ = false;
+        if (propMoved_ && SameProp()) {
+            Call(SetEntityCoordsNoOffset, prop_, propOrigin_.x, propOrigin_.y, propOrigin_.z,
+                 true, true, true);
+        }
+        prop_ = 0;
+        propMoved_ = false;
         if (proxy_ && Call<BOOL>(DoesEntityExist, proxy_)) {
             Call(SetEntityCollision, proxy_, false, false);
             Call(0xAE3CBE5BF394C9C9ull, &proxy_); // DELETE_ENTITY
@@ -346,8 +538,19 @@ private:
 
     RageApi api_;
     Chain chain_;
+    BuildingTrial trial_{};
+    Hit trialHit_{};
+    TrialPhase trialPhase_{};
+    Vec3 trialNormal_{}, trialOffset_{};
+    int trialProbe_{};
+    std::uint64_t trialStarted_{};
+    bool trialMoved_{};
     Ray ray_{};
     Vec3 pivot_, offset_, requestedOffset_;
+    Vec3 propOrigin_{};
+    int prop_{};
+    std::uint32_t propModel_{};
+    bool propMoved_{};
     bool selected_{}, pending_{}, loading_{}, leased_{};
     std::uint64_t lease_{}, started_{}, probeStarted_{};
     int proxy_{};
@@ -358,7 +561,7 @@ private:
 };
 
 void ScriptMain() {
-    LogDiagnostic("MapSpooner v0.1.2 ScriptMain started");
+    LogDiagnostic("MapSpooner v0.1.4 ScriptMain started");
     wchar_t executable[MAX_PATH]{};
     const auto length = GetModuleFileNameW(nullptr, executable, MAX_PATH);
     const auto* name = length < MAX_PATH ? std::wcsrchr(executable, L'\\') : nullptr;
@@ -371,17 +574,17 @@ void ScriptMain() {
     LogDiagnostic("Legacy PE timestamp=%08X size=%zu", image.Timestamp(), image.Size());
     const auto api = ResolveLegacy(image);
     Edit edit(api);
-    bool selectWasDown{}, resetWasDown{}, mouseWasDown{}, checkRendering{};
+    bool selectWasDown{}, trialWasDown{}, resetWasDown{}, mouseWasDown{}, checkRendering{};
     int camera{}, dragAxis{-1};
     Vec3 position, rotation;
-    float dragScreenX{}, dragScreenY{}, dragLength{};
+    float dragScreenX{}, dragScreenY{}, dragLength{}, dragAspect{1.f};
 
     for (;;) {
         DWORD foregroundProcess{};
         GetWindowThreadProcessId(GetForegroundWindow(), &foregroundProcess);
         const bool focused = foregroundProcess == GetCurrentProcessId();
         const bool toggle = toggleRequested.exchange(false, std::memory_order_relaxed);
-        const bool select = Down('E'), reset = Down('R');
+        const bool select = Down('E'), trial = Down('T'), reset = Down('R');
         const bool mouse = Down(VK_LBUTTON);
         const bool paused = (toggle || camera) && Call<BOOL>(IsPauseMenuActive) != 0;
         if (checkRendering) {
@@ -422,6 +625,7 @@ void ScriptMain() {
 
         // Consume the pending result on a later script tick, even after closing F12.
         edit.PollPick();
+        edit.PollTrial();
         if (camera && focused && !paused) {
             const float lookX = Call<float>(0x11E65974A982637Cull, 0, 1);
             const float lookY = Call<float>(0x11E65974A982637Cull, 0, 2);
@@ -431,6 +635,7 @@ void ScriptMain() {
                 edit.Reset();
                 dragAxis = -1;
             }
+            if (trial && !trialWasDown) edit.StartTrial();
             if (dragAxis < 0) {
                 // Freeze camera rotation on the press frame so the gizmo stays under the reticle.
                 if (!mouse || mouseWasDown) {
@@ -450,10 +655,11 @@ void ScriptMain() {
                     edit.BeginPick({position, position + forward * 600.f, ped});
                 }
             } else {
-                edit.Move(Axes[dragAxis] * ((lookX * dragScreenX + lookY * dragScreenY) * dragLength));
+                edit.Move(Axes[dragAxis] * ((lookX * dragAspect * dragScreenX + lookY * dragScreenY) *
+                                            dragLength));
             }
 
-            if (edit.CanEdit()) {
+            if (edit.Selected()) {
                 const Vec3 increment{
                     static_cast<float>(int(Down(VK_RIGHT)) - int(Down(VK_LEFT))),
                     static_cast<float>(int(Down(VK_UP)) - int(Down(VK_DOWN))),
@@ -467,26 +673,33 @@ void ScriptMain() {
             Call(0xBB7454BAFF08FE25ull, position.x, position.y, position.z, 0.f, 0.f, 0.f);
             if (edit.Selected()) {
                 const auto gizmo = DrawGizmo(edit.Pivot(), position, dragAxis);
-                if (edit.CanEdit() && mouse && !mouseWasDown && gizmo.hovered >= 0) {
-                    dragAxis = gizmo.hovered;
-                    dragScreenX = gizmo.screenX;
-                    dragScreenY = gizmo.screenY;
-                    dragLength = gizmo.length;
+                if (mouse && !mouseWasDown && gizmo.hovered >= 0) {
+                    if (edit.CanEdit()) {
+                        dragAxis = gizmo.hovered;
+                        dragScreenX = gizmo.screenX;
+                        dragScreenY = gizmo.screenY;
+                        dragLength = gizmo.length;
+                        dragAspect = gizmo.aspect;
+                    } else {
+                        edit.Move({});
+                    }
                 }
             }
 
             Call(0x3A618A217E5154F0ull, 0.5f, 0.5f, 0.010f, 0.0018f, 255, 255, 255, 220, false);
             Call(0x3A618A217E5154F0ull, 0.5f, 0.5f, 0.0010f, 0.0170f, 255, 255, 255, 220, false);
-            Text(0.055f, "MAP SPOONER | F12 Esci | WASD Camera | Spazio/Ctrl Quota");
+            Text(0.055f, "MAP SPOONER 0.1.4 | F12 Esci | WASD Camera | Spazio/Ctrl Quota");
             Text(0.080f, edit.Label());
-            Text(0.105f, api.pick && api.inspect && api.acquire && api.apply && api.restoreAndRelease
-                        ? "Frecce/PagSu/PagGiu o mouse sull'asse | R Ripristina"
-                        : "Profilo RAGE assente | ispezione raycast");
+            if (edit.CanEdit()) Text(0.105f, "Frecce/PagSu/PagGiu o mouse sull'asse | R Ripristina");
+            Text(0.155f, logLocation == LogLocation::Game ? "Log: cartella GTA V"
+                         : logLocation == LogLocation::Temp ? "Log: %TEMP%/MapSpooner.log"
+                         : "Log non scrivibile");
             if (*edit.Status()) Text(0.130f, edit.Status());
         } else {
             dragAxis = -1;
         }
         selectWasDown = select;
+        trialWasDown = trial;
         resetWasDown = reset;
         mouseWasDown = mouse;
         scriptWait(0);
@@ -498,7 +711,6 @@ void ScriptMain() {
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(module);
-        spooner::moduleHandle = module;
         keyboardHandlerRegister(spooner::OnKeyboard);
         scriptRegister(module, spooner::ScriptMain);
     } else if (reason == DLL_PROCESS_DETACH && !reserved) {
