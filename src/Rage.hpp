@@ -96,6 +96,7 @@ struct Chain {
 };
 
 class Image;
+void LogDiagnostic(const char* format, ...);
 struct RageApi {
     // Custom adapter ABIs. Do not cast arbitrary game function addresses to these.
     bool (*pick)(const Ray&, const Hit&, EntityId&){};

@@ -3,22 +3,54 @@
 
 #include <windows.h>
 #include <main.h>
+#include <types.h>
 #include <algorithm>
+#include <atomic>
 #include <bit>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <type_traits>
 
 namespace spooner {
 namespace {
-// ScriptHookV marshals native vectors in three 8-byte slots.
-struct NativeVector {
-    alignas(8) float x{};
-    alignas(8) float y{};
-    alignas(8) float z{};
-    Vec3 Unpack() const { return {x, y, z}; }
-};
-static_assert(sizeof(NativeVector) == 24);
+HMODULE moduleHandle{};
+std::atomic_bool toggleRequested{};
+
+void OnKeyboard(DWORD key, WORD, BYTE, BOOL, BOOL, BOOL wasDown, BOOL isUp) {
+    if (key == VK_F12 && !wasDown && !isUp) {
+        toggleRequested.store(true, std::memory_order_relaxed);
+    }
+}
+}
+
+void LogDiagnostic(const char* format, ...) {
+    wchar_t path[MAX_PATH]{};
+    const auto length = GetModuleFileNameW(moduleHandle, path, MAX_PATH);
+    if (!length || length >= MAX_PATH) return;
+    auto* fileName = std::wcsrchr(path, L'\\');
+    if (!fileName) return;
+    ++fileName;
+    if (wcscpy_s(fileName, MAX_PATH - (fileName - path), L"MapSpooner.log") != 0) return;
+    FILE* file{};
+    if (_wfopen_s(&file, path, L"a") != 0 || !file) return;
+    va_list args;
+    va_start(args, format);
+    std::vfprintf(file, format, args);
+    va_end(args);
+    std::fputc('\n', file);
+    std::fclose(file);
+}
+
+namespace {
+// Vector arguments and results use the padding defined by ScriptHookV.
+static_assert(sizeof(Vector3) == 24 && offsetof(Vector3, y) == 8 && offsetof(Vector3, z) == 16);
+Vec3 Unpack(Vector3 v) { return {v.x, v.y, v.z}; }
+
+bool Finite(Vec3 v) {
+    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+}
 
 template<class T> std::uint64_t Slot(T value) {
     if constexpr (std::is_pointer_v<T>) {
@@ -45,6 +77,7 @@ constexpr auto DoesEntityExist = 0x7239B21A38F536BAull;
 constexpr auto SetEntityCollision = 0x1A9205C1B9EE827Full;
 constexpr auto SetEntityCoordsNoOffset = 0x239A3351AC1DA385ull;
 constexpr auto RemoveModel = 0xE532F5D78798DAABull;
+constexpr auto IsPauseMenuActive = 0xB0034A223497FFCBull;
 
 bool Down(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; }
 
@@ -55,16 +88,21 @@ Vec3 Forward(Vec3 rotation) {
     return {-std::sin(yaw) * horizontal, std::cos(yaw) * horizontal, std::sin(pitch)};
 }
 
-Hit Raycast(const Ray& ray) {
+int StartRaycast(const Ray& ray) {
     const auto a = ray.start, b = ray.end;
-    // Intersect world + entities. Option 4 ignores surfaces with no collision.
-    const int probe = Call<int>(0x377906D8A31E5586ull, a.x, a.y, a.z,
-                               b.x, b.y, b.z, 511, ray.ignore, 4);
+    // World, vehicles, peds, ragdolls, objects and glass.
+    constexpr int flags = 1 | 2 | 4 | 8 | 16 | 64;
+    return Call<int>(0x7EE9F5D83DD4F90Eull, a.x, a.y, a.z,
+                     b.x, b.y, b.z, flags, ray.ignore, 4); // START_SHAPE_TEST_LOS_PROBE
+}
+
+int ReadRaycast(int probe, Hit& result) {
     BOOL hit{};
-    NativeVector point, normal;
-    int entity{};
+    alignas(16) Vector3 point{}, normal{};
+    Entity entity{};
     const int status = Call<int>(0x3D87450E15D98694ull, probe, &hit, &point, &normal, &entity);
-    return {status == 2 && hit != 0, point.Unpack(), normal.Unpack(), entity};
+    if (status == 2) result = {hit != 0, Unpack(point), Unpack(normal), entity};
+    return status;
 }
 
 void Text(float y, const char* message) {
@@ -133,10 +171,47 @@ class Edit {
 public:
     explicit Edit(RageApi api) : api_(api) {}
 
-    void Pick(const Ray& ray) {
-        Reset();
-        const auto hit = Raycast(ray);
-        if (!hit.hit) {
+    void BeginPick(const Ray& ray) {
+        if (probe_) return;
+        ResetSelection();
+        if (!Finite(ray.start) || !Finite(ray.end)) {
+            LogDiagnostic("E: invalid camera coordinates");
+            status_ = "Coordinate camera non valide";
+            return;
+        }
+        ray_ = ray;
+        LogDiagnostic("E: START_SHAPE_TEST_LOS_PROBE ignore=%d", ray.ignore);
+        probe_ = StartRaycast(ray);
+        discardProbe_ = false;
+        loggedFirstPoll_ = false;
+        probeStarted_ = GetTickCount64();
+        LogDiagnostic("E: shape test handle=%d", probe_);
+        status_ = probe_ ? "Raycast in corso..." : "Raycast rifiutato dal motore";
+    }
+
+    void PollPick() {
+        if (!probe_) return;
+        if (!loggedFirstPoll_) {
+            LogDiagnostic("E: GET_SHAPE_TEST_RESULT handle=%d", probe_);
+            loggedFirstPoll_ = true;
+        }
+        Hit hit{};
+        const int status = ReadRaycast(probe_, hit);
+        if (status == 1 && GetTickCount64() - probeStarted_ < 3000) return;
+        LogDiagnostic("E: shape test status=%d hit=%d entity=%d point=(%.3f, %.3f, %.3f)",
+                      status, int(hit.hit), hit.handle, hit.point.x, hit.point.y, hit.point.z);
+        probe_ = 0;
+        if (discardProbe_) return;
+        status_ = "";
+        if (status != 2) {
+            status_ = status == 1 ? "Raycast scaduto" : "Risultato raycast non valido";
+            return;
+        }
+        ShowHit(ray_, hit);
+    }
+
+    void ShowHit(const Ray& ray, const Hit& hit) {
+        if (!hit.hit || !Finite(hit.point) || !Finite(hit.normal)) {
             std::snprintf(label_, sizeof(label_), "Nessuna superficie colpita");
             return;
         }
@@ -158,13 +233,7 @@ public:
             std::snprintf(label_, sizeof(label_), "Hit mondo | CBuilding non risolta (handle 0)");
             return;
         }
-        if (!Call<BOOL>(DoesEntityExist, hit.handle)) {
-            std::snprintf(label_, sizeof(label_), "Hit senza handle valido");
-            return;
-        }
-        const auto model = Call<std::uint32_t>(0x9F47B058362C84B5ull, hit.handle);
-        std::snprintf(label_, sizeof(label_), "Handle %d | modello %08X | ptr %p",
-                      hit.handle, model, static_cast<void*>(getScriptHandleBaseAddress(hit.handle)));
+        std::snprintf(label_, sizeof(label_), "Entita' colpita | handle %d", hit.handle);
     }
 
     bool CanEdit() const {
@@ -193,7 +262,7 @@ public:
         const auto& root = chain_.entry[0];
         if (!proxy_) {
             if (!loading_) {
-                if (!Call<BOOL>(0x35B9E0803292B641ull, root.modelHash)) { // IS_MODEL_VALID
+                if (!Call<BOOL>(0xC0296A2EDF545E92ull, root.modelHash)) { // IS_MODEL_VALID
                     CancelPending("Modello non utilizzabile come CObject");
                     return;
                 }
@@ -249,6 +318,12 @@ public:
     }
 
     void Reset() {
+        discardProbe_ = true;
+        ResetSelection();
+    }
+
+private:
+    void ResetSelection() {
         if (proxy_ && Call<BOOL>(DoesEntityExist, proxy_)) {
             Call(SetEntityCollision, proxy_, false, false);
             Call(0xAE3CBE5BF394C9C9ull, &proxy_); // DELETE_ENTITY
@@ -262,7 +337,6 @@ public:
         chain_ = {};
         std::snprintf(label_, sizeof(label_), "E  Seleziona davanti al mirino");
     }
-private:
     void CancelPending(const char* message) {
         if (loading_) Call(RemoveModel, chain_.entry[0].modelHash);
         loading_ = false;
@@ -272,20 +346,32 @@ private:
 
     RageApi api_;
     Chain chain_;
+    Ray ray_{};
     Vec3 pivot_, offset_, requestedOffset_;
     bool selected_{}, pending_{}, loading_{}, leased_{};
-    std::uint64_t lease_{}, started_{};
+    std::uint64_t lease_{}, started_{}, probeStarted_{};
     int proxy_{};
+    int probe_{};
+    bool discardProbe_{}, loggedFirstPoll_{};
     char label_[99]{"E  Seleziona davanti al mirino"};
     const char* status_{""};
 };
 
 void ScriptMain() {
-    const auto game = GetModuleHandleW(L"GTA5.exe");
-    if (!game) return;
-    const auto api = ResolveLegacy(Image(game));
+    LogDiagnostic("MapSpooner v0.1.2 ScriptMain started");
+    wchar_t executable[MAX_PATH]{};
+    const auto length = GetModuleFileNameW(nullptr, executable, MAX_PATH);
+    const auto* name = length < MAX_PATH ? std::wcsrchr(executable, L'\\') : nullptr;
+    if (!length || length >= MAX_PATH || !name || _wcsicmp(name + 1, L"GTA5.exe") != 0) {
+        LogDiagnostic("Expected the GTA V Legacy GTA5.exe process.");
+        return;
+    }
+
+    const Image image(GetModuleHandleW(nullptr));
+    LogDiagnostic("Legacy PE timestamp=%08X size=%zu", image.Timestamp(), image.Size());
+    const auto api = ResolveLegacy(image);
     Edit edit(api);
-    bool f12WasDown{}, selectWasDown{}, resetWasDown{}, mouseWasDown{};
+    bool selectWasDown{}, resetWasDown{}, mouseWasDown{}, checkRendering{};
     int camera{}, dragAxis{-1};
     Vec3 position, rotation;
     float dragScreenX{}, dragScreenY{}, dragLength{};
@@ -294,10 +380,16 @@ void ScriptMain() {
         DWORD foregroundProcess{};
         GetWindowThreadProcessId(GetForegroundWindow(), &foregroundProcess);
         const bool focused = foregroundProcess == GetCurrentProcessId();
-        const bool f12 = Down(VK_F12), select = Down('E'), reset = Down('R');
+        const bool toggle = toggleRequested.exchange(false, std::memory_order_relaxed);
+        const bool select = Down('E'), reset = Down('R');
         const bool mouse = Down(VK_LBUTTON);
-        const bool typing = Call<BOOL>(0xB8DFD30D6973E135ull) != 0; // IS_PAUSE_MENU_ACTIVE
-        if (focused && !typing && f12 && !f12WasDown) {
+        const bool paused = (toggle || camera) && Call<BOOL>(IsPauseMenuActive) != 0;
+        if (checkRendering) {
+            LogDiagnostic("Camera rendering=%d", int(Call<BOOL>(0x02EC0AF5C5A49B7Aull, camera) != 0));
+            checkRendering = false;
+        }
+        if (toggle) LogDiagnostic("F12 received; paused=%d", int(paused));
+        if (toggle && !paused) {
             if (camera) {
                 edit.Reset();
                 dragAxis = -1;
@@ -305,20 +397,32 @@ void ScriptMain() {
                 Call(0x865908C81A2C22E9ull, camera, false); // DESTROY_CAM
                 Call(0x31B73D1EA9F01DA2ull); // CLEAR_FOCUS
                 camera = 0;
+                LogDiagnostic("Camera closed");
             } else {
-                position = Call<NativeVector>(0x14D6F5678D8F1B37ull).Unpack();
-                rotation = Call<NativeVector>(0x837765A25378F0BBull, 2).Unpack();
-                camera = Call<int>(0xC3981DCE61D9E13Full, "DEFAULT_SCRIPTED_CAMERA", true);
-                if (camera) Call(0x07E5B515DB0636FCull, true, false, 0, true, false);
+                position = Unpack(Call<Vector3>(0x14D6F5678D8F1B37ull));
+                rotation = Unpack(Call<Vector3>(0x837765A25378F0BBull, 2));
+                const float fov = Call<float>(0x65019750A0324133ull); // GET_GAMEPLAY_CAM_FOV
+                camera = Call<int>(0xB51194800B257161ull, "DEFAULT_SCRIPTED_CAMERA",
+                                   position.x, position.y, position.z,
+                                   rotation.x, rotation.y, rotation.z, fov, true, 2);
+                LogDiagnostic("Create camera handle=%d", camera);
+                if (camera && Call<BOOL>(0xA7A932170592B50Eull, camera)) {
+                    Call(0x07E5B515DB0636FCull, true, false, 0, true, false);
+                    checkRendering = true;
+                } else {
+                    camera = 0;
+                }
             }
         }
 
-        if (camera) {
+        if (camera && !paused) {
             Call(0x5F4B6931816E599Bull, 0); // DISABLE_ALL_CONTROL_ACTIONS
             Call(0x719FF505F097FD20ull); // HIDE_HUD_AND_RADAR_THIS_FRAME
         }
 
-        if (camera && focused && !typing) {
+        // Consume the pending result on a later script tick, even after closing F12.
+        edit.PollPick();
+        if (camera && focused && !paused) {
             const float lookX = Call<float>(0x11E65974A982637Cull, 0, 1);
             const float lookY = Call<float>(0x11E65974A982637Cull, 0, 2);
             const float dt = std::clamp(Call<float>(0x15C40837039FFAF7ull), 0.f, 0.05f);
@@ -341,9 +445,9 @@ void ScriptMain() {
                                   Vec3{0, 0, static_cast<float>(int(Down(VK_SPACE)) - int(Down(VK_CONTROL)))};
                 position = position + move * (dt * (Down(VK_SHIFT) ? 45.f : 12.f));
                 if (select && !selectWasDown) {
+                    LogDiagnostic("E received");
                     const int ped = Call<int>(0xD80958FC74E988A6ull); // PLAYER_PED_ID
-                    const int vehicle = Call<int>(0x9A9112A0FE9A4713ull, ped, false);
-                    edit.Pick({position, position + forward * 600.f, vehicle ? vehicle : ped});
+                    edit.BeginPick({position, position + forward * 600.f, ped});
                 }
             } else {
                 edit.Move(Axes[dragAxis] * ((lookX * dragScreenX + lookY * dragScreenY) * dragLength));
@@ -382,7 +486,6 @@ void ScriptMain() {
         } else {
             dragAxis = -1;
         }
-        f12WasDown = f12;
         selectWasDown = select;
         resetWasDown = reset;
         mouseWasDown = mouse;
@@ -395,8 +498,11 @@ void ScriptMain() {
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(module);
+        spooner::moduleHandle = module;
+        keyboardHandlerRegister(spooner::OnKeyboard);
         scriptRegister(module, spooner::ScriptMain);
     } else if (reason == DLL_PROCESS_DETACH && !reserved) {
+        keyboardHandlerUnregister(spooner::OnKeyboard);
         scriptUnregister(module);
     }
     return TRUE;

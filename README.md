@@ -1,6 +1,6 @@
-# Map Spooner 0.1 · GTA V Legacy
+# Map Spooner 0.1.2 · GTA V Legacy
 
-Prototipo C++20 per ScriptHookV in modalità Storia. Il progetto predefinito apre la freecam, esegue il raycast, mostra il punto colpito con il gizmo e identifica i bersagli dotati di handle. Per la selezione di una `CBuilding` senza handle e lo spostamento della mappa occorre un adattatore RAGE verificato sulla propria build. Quell'adattatore non è incluso. Il punto di collegamento è `ResolveLegacy`.
+Prototipo C++20 per ScriptHookV in modalità Storia. Il progetto predefinito apre la freecam, esegue il raycast, mostra il punto colpito con il gizmo e riporta l'eventuale handle del bersaglio. Per la selezione di una `CBuilding` senza handle e lo spostamento della mappa occorre un adattatore RAGE verificato sulla propria build. Quell'adattatore non è incluso. Il punto di collegamento è `ResolveLegacy`.
 
 ## Comandi
 
@@ -15,7 +15,16 @@ Prototipo C++20 per ScriptHookV in modalità Storia. Il progetto predefinito apr
 | Mouse sinistro sull'asse evidenziato | Trascina l'asse sotto il mirino, con profilo RAGE attivo |
 | R | Ripristina la selezione e l'eventuale edit |
 
-Il prototipo tiene un edit temporaneo alla volta. Chiudi lo Spooner con F12 prima di scaricare a caldo l'ASI, così il ripristino gira sulla fibra ScriptHookV. Il raycast lavora sulle collisioni, quindi una mesh priva di collider non è selezionabile mediante questa modalità. In ispezione pura, un hit mondo mostra il punto del collider e un prop con handle mostra hash e indirizzo restituito dallo SDK.
+
+## Diagnostica di avvio e build 3889
+
+La versione 0.1.1 registra F12 tramite il callback tastiera di ScriptHookV e usa il vero native `IS_PAUSE_MENU_ACTIVE` (`0xB0034A223497FFCB`). La versione precedente usava per errore l'hash di `NETWORK_IS_PLAYER_ACTIVE` senza passarle un giocatore.
+
+Una build da questo sorgente scrive `MapSpooner.log` accanto all'ASI, con le tappe `ScriptMain started`, `F12 received`, creazione e rendering della camera, risultati del raycast e riscontro delle firme RAGE in memoria. Il pacchetto binario separato **F12 Hotfix** corregge solo l'hash nell'ASI originale e serve per provare subito F12.
+
+La versione 0.1.2 cambia il percorso di **E** dopo la segnalazione di eccezione in `GTA5.exe+0x016CD1A3`. Avvia un raycast asincrono, legge il risultato nei frame successivi solo finché il test è in corso e usa il layout `Vector3` dell'SDK. Il percorso generico mostra il punto e l'eventuale handle. Nel log compaiono `E received`, l'avvio del probe, il suo handle e la prima lettura del risultato. Questo distingue un problema all'avvio del probe da uno durante la lettura.
+
+La copia su disco di `GTA5.exe` 1.0.3889.0 non corrisponde alle firme pubbliche provate per costruzione, caricamento/scaricamento e conversione GUID delle entità mappa. Il resolver ripete la ricerca nelle pagine leggibili del gioco caricato. Anche se trova una firma univoca, per attivare le scritture servono ancora la verifica del passaggio da hit fisico a proprietario, il link LOD e il ciclo di vita della collisione statica. Il resolver predefinito registra i risultati e lascia disponibile l'ispezione.
 
 ## Compilazione
 
@@ -69,5 +78,6 @@ Il pattern scanning può riusare lo stesso profilo tra aggiornamenti quando le i
 - [ScriptHookV e SDK ufficiale](https://www.dev-c.com/gtav/scripthookv/)
 - [FiveM · EntitySystem.h](https://github.com/citizenfx/fivem/blob/master/code/components/gta-streaming-five/include/EntitySystem.h)
 - [CodeWalker · YmapFile.cs](https://github.com/dexyfex/CodeWalker/blob/master/CodeWalker.Core/GameFiles/FileTypes/YmapFile.cs)
+- [FiveM · GamePrimitives_MapData.cpp](https://github.com/citizenfx/fivem/blob/master/code/components/extra-natives-five/src/GamePrimitives_MapData.cpp)
 - [Cfx Native Reference · GET_SHAPE_TEST_RESULT](https://github.com/citizenfx/natives/blob/master/SHAPETEST/GetShapeTestResult.md)
 - [Cfx Native Reference · CREATE_OBJECT_NO_OFFSET](https://github.com/citizenfx/natives/blob/master/OBJECT/CreateObjectNoOffset.md)
